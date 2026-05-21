@@ -59,12 +59,34 @@ impl Git {
     }
 
     pub fn update(&self, gitref: Option<String>) -> Result<(String, String)> {
-        let gitref = gitref.map_or_else(|| self.current_branch(), Ok)?;
-        self.update_ref(gitref, false)
+        match gitref {
+            Some(gitref) => self.update_explicit_ref(gitref),
+            None => self.update_ref(self.current_branch()?, false),
+        }
     }
 
     pub fn update_tag(&self, gitref: String) -> Result<(String, String)> {
         self.update_ref(gitref, true)
+    }
+
+    fn update_explicit_ref(&self, gitref: String) -> Result<(String, String)> {
+        if self.remote_has_ref("heads", &gitref)? {
+            return self.update_ref(gitref, false);
+        }
+        if self.remote_has_ref("tags", &gitref)? {
+            return self.update_ref(gitref, true);
+        }
+        self.update_ref(gitref, false)
+    }
+
+    fn remote_has_ref(&self, namespace: &str, gitref: &str) -> Result<bool> {
+        let refname = format!("refs/{namespace}/{gitref}");
+        let output = git_cmd_read!(&self.dir, "ls-remote", "origin", &refname)?;
+        Ok(output.lines().any(|line| {
+            line.split_whitespace()
+                .nth(1)
+                .is_some_and(|found_ref| found_ref == refname)
+        }))
     }
 
     /// Detached `git checkout --force <ref>` with no fetch. Used after `clone`
@@ -401,7 +423,24 @@ impl<'a> CloneOptions<'a> {
 mod tests {
     use super::{CloneOptions, Git, looks_like_sha};
     use crate::config::Settings;
-    use std::process::Command;
+    use std::path::Path;
+    use std::process::{Command, Output};
+
+    fn git_runner() -> impl Fn(&Path, &[&str]) -> Output {
+        |dir, args| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .expect("spawn git");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            out
+        }
+    }
 
     #[test]
     fn sha_detection() {
@@ -430,19 +469,7 @@ mod tests {
         let src = tmp.path().join("src");
         std::fs::create_dir_all(&src).unwrap();
 
-        let git_in = |dir: &std::path::Path, args: &[&str]| {
-            let out = Command::new("git")
-                .args(args)
-                .current_dir(dir)
-                .output()
-                .expect("spawn git");
-            assert!(
-                out.status.success(),
-                "git {args:?} failed: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-            out
-        };
+        let git_in = git_runner();
         git_in(&src, &["-c", "init.defaultBranch=main", "init", "-q"]);
         git_in(
             &src,
@@ -517,5 +544,58 @@ mod tests {
             s.gix = Some(backups.0);
             s.libgit2 = Some(backups.1);
         });
+    }
+
+    #[test]
+    fn update_explicit_ref_handles_annotated_tags() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        std::fs::create_dir_all(&src).unwrap();
+
+        let git_in = git_runner();
+        git_in(&src, &["-c", "init.defaultBranch=main", "init", "-q"]);
+        git_in(
+            &src,
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "main",
+            ],
+        );
+        git_in(
+            &src,
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "tag",
+                "-a",
+                "v1.0.0",
+                "-m",
+                "release",
+            ],
+        );
+
+        let url = format!("file://{}", src.display());
+        let git = Git::new(&dst);
+        git.clone(&url, CloneOptions::default()).unwrap();
+        git.update(Some("v1.0.0".to_string()))
+            .expect("explicit annotated tag refs should update as tags");
+
+        let described = git_in(&dst, &["describe", "--tags", "--exact-match", "HEAD"]);
+        assert_eq!(
+            String::from_utf8(described.stdout).unwrap().trim(),
+            "v1.0.0"
+        );
+        let branch = git_in(&dst, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        assert_eq!(String::from_utf8(branch.stdout).unwrap().trim(), "HEAD");
     }
 }
