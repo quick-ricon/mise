@@ -17,6 +17,12 @@ pub struct Git {
     pub repo: OnceCell<gix::Repository>,
 }
 
+enum GitRefKind {
+    Branch,
+    Tag,
+    Unqualified,
+}
+
 macro_rules! git_cmd {
     ( $dir:expr $(, $arg:expr )* $(,)? ) => {
         {
@@ -61,22 +67,22 @@ impl Git {
     pub fn update(&self, gitref: Option<String>) -> Result<(String, String)> {
         match gitref {
             Some(gitref) => self.update_explicit_ref(gitref),
-            None => self.update_ref(self.current_branch()?, false),
+            None => self.update_ref(self.current_branch()?, GitRefKind::Branch),
         }
     }
 
     pub fn update_tag(&self, gitref: String) -> Result<(String, String)> {
-        self.update_ref(gitref, true)
+        self.update_ref(gitref, GitRefKind::Tag)
     }
 
     fn update_explicit_ref(&self, gitref: String) -> Result<(String, String)> {
         if self.remote_has_ref("heads", &gitref)? {
-            return self.update_ref(gitref, false);
+            return self.update_ref(gitref, GitRefKind::Branch);
         }
         if self.remote_has_ref("tags", &gitref)? {
-            return self.update_ref(gitref, true);
+            return self.update_ref(gitref, GitRefKind::Tag);
         }
-        self.update_ref(gitref, false)
+        self.update_ref(gitref, GitRefKind::Unqualified)
     }
 
     fn remote_has_ref(&self, namespace: &str, gitref: &str) -> Result<bool> {
@@ -121,7 +127,7 @@ impl Git {
         Ok(())
     }
 
-    fn update_ref(&self, gitref: String, is_tag_ref: bool) -> Result<(String, String)> {
+    fn update_ref(&self, gitref: String, ref_kind: GitRefKind) -> Result<(String, String)> {
         debug!("updating {} to {}", self.dir.display(), gitref);
         let exec = |cmd: Expression| match cmd.stderr_to_stdout().stdout_capture().unchecked().run()
         {
@@ -139,11 +145,16 @@ impl Git {
         };
         debug!("updating {} to {} with git", self.dir.display(), gitref);
 
-        let (refspec, checkout_ref) = if is_tag_ref {
-            let tag_ref = format!("refs/tags/{gitref}");
-            (format!("{tag_ref}:{tag_ref}"), tag_ref)
-        } else {
-            (format!("{gitref}:{gitref}"), gitref)
+        let (refspec, checkout_ref) = match ref_kind {
+            GitRefKind::Branch => {
+                let branch_ref = format!("refs/heads/{gitref}");
+                (format!("{branch_ref}:{branch_ref}"), gitref)
+            }
+            GitRefKind::Tag => {
+                let tag_ref = format!("refs/tags/{gitref}");
+                (format!("{tag_ref}:{tag_ref}"), tag_ref)
+            }
+            GitRefKind::Unqualified => (format!("{gitref}:{gitref}"), gitref),
         };
         exec(git_cmd!(
             &self.dir,
@@ -599,6 +610,84 @@ mod tests {
         );
         let branch = git_in(&dst, &["rev-parse", "--abbrev-ref", "HEAD"]);
         assert_eq!(String::from_utf8(branch.stdout).unwrap().trim(), "HEAD");
+    }
+
+    #[test]
+    fn update_explicit_ref_prefers_branch_when_remote_branch_and_tag_share_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        std::fs::create_dir_all(&src).unwrap();
+
+        let git_in = git_runner();
+        git_in(&src, &["-c", "init.defaultBranch=main", "init", "-q"]);
+        git_in(
+            &src,
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "tagged commit",
+            ],
+        );
+        git_in(
+            &src,
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "tag",
+                "-a",
+                "v1.0.0",
+                "-m",
+                "release",
+            ],
+        );
+        git_in(&src, &["checkout", "-q", "-b", "v1.0.0"]);
+        git_in(
+            &src,
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "branch commit",
+            ],
+        );
+        let branch_commit = git_in(&src, &["rev-parse", "refs/heads/v1.0.0"]);
+        let branch_commit = String::from_utf8(branch_commit.stdout).unwrap();
+        let branch_commit = branch_commit.trim();
+        let tag_commit = git_in(&src, &["rev-parse", "refs/tags/v1.0.0^{}"]);
+        let tag_commit = String::from_utf8(tag_commit.stdout).unwrap();
+        let tag_commit = tag_commit.trim();
+        assert_ne!(branch_commit, tag_commit);
+
+        let url = format!("file://{}", src.display());
+        let git = Git::new(&dst);
+        git.clone(&url, CloneOptions::default()).unwrap();
+        git.update(Some("v1.0.0".to_string()))
+            .expect("branch refs should be updated with qualified branch refspecs");
+
+        let head = git_in(&dst, &["rev-parse", "HEAD"]);
+        assert_eq!(
+            String::from_utf8(head.stdout).unwrap().trim(),
+            branch_commit
+        );
+        let branch = git_in(&dst, &["symbolic-ref", "--quiet", "HEAD"]);
+        assert_eq!(
+            String::from_utf8(branch.stdout).unwrap().trim(),
+            "refs/heads/v1.0.0"
+        );
     }
 
     #[test]
