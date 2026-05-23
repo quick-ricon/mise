@@ -139,10 +139,11 @@ impl Git {
         };
         debug!("updating {} to {} with git", self.dir.display(), gitref);
 
-        let refspec = if is_tag_ref {
-            format!("refs/tags/{gitref}:refs/tags/{gitref}")
+        let (refspec, checkout_ref) = if is_tag_ref {
+            let tag_ref = format!("refs/tags/{gitref}");
+            (format!("{tag_ref}:{tag_ref}"), tag_ref)
         } else {
-            format!("{gitref}:{gitref}")
+            (format!("{gitref}:{gitref}"), gitref)
         };
         exec(git_cmd!(
             &self.dir,
@@ -161,7 +162,7 @@ impl Git {
             "advice.objectNameWarning=false",
             "checkout",
             "--force",
-            &gitref
+            &checkout_ref
         ))?;
         let post_rev = self.current_sha()?;
         touch_dir(&self.dir)?;
@@ -429,6 +430,7 @@ mod tests {
     fn git_runner() -> impl Fn(&Path, &[&str]) -> Output {
         |dir, args| {
             let out = Command::new("git")
+                .args(["-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"])
                 .args(args)
                 .current_dir(dir)
                 .output()
@@ -594,6 +596,78 @@ mod tests {
         assert_eq!(
             String::from_utf8(described.stdout).unwrap().trim(),
             "v1.0.0"
+        );
+        let branch = git_in(&dst, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        assert_eq!(String::from_utf8(branch.stdout).unwrap().trim(), "HEAD");
+    }
+
+    #[test]
+    fn update_tag_ref_ignores_stale_local_branch_with_same_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        std::fs::create_dir_all(&src).unwrap();
+
+        let git_in = git_runner();
+        git_in(&src, &["-c", "init.defaultBranch=main", "init", "-q"]);
+        git_in(
+            &src,
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "tagged commit",
+            ],
+        );
+        git_in(
+            &src,
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "tag",
+                "-a",
+                "v1.0.0",
+                "-m",
+                "release",
+            ],
+        );
+        let tagged_commit = git_in(&src, &["rev-parse", "HEAD"]);
+        let tagged_commit = String::from_utf8(tagged_commit.stdout).unwrap();
+        let tagged_commit = tagged_commit.trim();
+
+        let url = format!("file://{}", src.display());
+        let git = Git::new(&dst);
+        git.clone(&url, CloneOptions::default()).unwrap();
+        git_in(&dst, &["checkout", "-q", "-b", "v1.0.0"]);
+        git_in(
+            &dst,
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "stale local branch",
+            ],
+        );
+
+        git.update(Some("v1.0.0".to_string()))
+            .expect("tag update should not checkout same-named local branches");
+
+        let head = git_in(&dst, &["rev-parse", "HEAD"]);
+        assert_eq!(
+            String::from_utf8(head.stdout).unwrap().trim(),
+            tagged_commit
         );
         let branch = git_in(&dst, &["rev-parse", "--abbrev-ref", "HEAD"]);
         assert_eq!(String::from_utf8(branch.stdout).unwrap().trim(), "HEAD");
